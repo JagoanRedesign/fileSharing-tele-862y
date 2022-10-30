@@ -6,7 +6,7 @@
     "file",
     "sharing"
   ],
-  "repository": "https://github.com/AdminCantik/FileSharing-Pekob",
+  "repository": "https://github.com/JagoanRedesign/fileSharing-tele",
   "logo": "https://telegra.ph/file/17577b5183ef34527a7e0.jpg",
   "env": {
     "TG_BOT_TOKEN": {
@@ -59,7 +59,7 @@
       "required": false
     },
     "CHANNELBC":{
-      "description": "Username Channel  Backup [ Jangan Pake @ ]",
+      "description": "Terima kasih kepada [ Jangan Pake @ ]",
       "value": "asup***",
       "required": false
     },
