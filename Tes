@@ -1,0 +1,622 @@
+// File: worker.js
+// Cloudflare Worker untuk Telegram Bot File Sharing dengan Logika Lengkap
+
+const BOT_TOKEN = 'YOUR_BOT_TOKEN'; // Ganti dengan token bot Anda
+const API_URL = `https://api.telegram.org/bot${BOT_TOKEN}`;
+
+// Konfigurasi (sesuaikan dengan config.py Anda)
+const CONFIG = {
+  ADMINS: [12345678], // Ganti dengan ID admin Anda
+  CHANNEL_ID: -1001234567890, // ID channel database
+  FORCE_SUB_CHANNEL: -1001234567891, // ID channel wajib subscribe
+  FORCE_SUB_GROUP: -1001234567892, // ID group wajib subscribe
+  OWNER: 'ReszXD', // Username pemilik
+  START_MSG: `Halo {first}! Selamat datang di bot file sharing.\n\nGunakan bot ini untuk mendapatkan file dari channel kami.`,
+  FORCE_MSG: `Halo {first}! Anda harus bergabung dengan channel/group kami terlebih dahulu untuk menggunakan bot ini.`
+};
+
+// Simpan data di Cloudflare KV (harus setup KV namespace terlebih dahulu)
+const USERS_KV = 'users'; // Nama KV namespace untuk penyimpanan user
+
+// Handler utama
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
+
+async function handleRequest(request) {
+  if (request.method === 'POST') {
+    try {
+      const update = await request.json();
+      return handleUpdate(update);
+    } catch (e) {
+      console.error('Error parsing request:', e);
+      return new Response('Error parsing request', { status: 400 });
+    }
+  }
+  return new Response('OK', { status: 200 });
+}
+
+async function handleUpdate(update) {
+  if (!update) return new Response('OK', { status: 200 });
+
+  try {
+    // Handle callback query
+    if (update.callback_query) {
+      return handleCallbackQuery(update.callback_query);
+    }
+
+    // Handle channel post
+    if (update.channel_post) {
+      return handleChannelPost(update.channel_post);
+    }
+
+    // Handle message
+    if (update.message) {
+      const message = update.message;
+      const text = message.text || '';
+      const from = message.from;
+
+      // Add user to database
+      await addUser(from.id, from.username);
+
+      // Handle commands
+      if (text.startsWith('/')) {
+        const command = text.split(' ')[0].toLowerCase();
+
+        switch (command) {
+          case '/start':
+            return handleStartCommand(message);
+          case '/broadcast':
+            return handleBroadcastCommand(message);
+          case '/batch':
+            return handleBatchCommand(message);
+          case '/genlink':
+            return handleGenLinkCommand(message);
+          case '/users':
+            return handleUsersCommand(message);
+          case '/id':
+            return handleIdCommand(message);
+          case '/ping':
+            return handlePingCommand(message);
+          case '/uptime':
+            return handleUptimeCommand(message);
+        }
+      }
+
+      // Handle file posts from admins
+      if (CONFIG.ADMINS.includes(from.id) && (message.document || message.photo || message.video)) {
+        return handleFilePost(message);
+      }
+    }
+  } catch (e) {
+    console.error('Error handling update:', e);
+    return new Response('Error handling update', { status: 500 });
+  }
+
+  return new Response('OK', { status: 200 });
+}
+
+/*********************
+ * COMMAND HANDLERS *
+ *********************/
+
+async function handleStartCommand(message) {
+  const chatId = message.chat.id;
+  const text = message.text;
+  const from = message.from;
+
+  // Jika ada parameter di /start
+  if (text.split(' ').length > 1) {
+    const base64String = text.split(' ')[1];
+    try {
+      const decodedString = atob(base64String);
+      const match = decodedString.match(/get-(\d+)(?:-(\d+))?/);
+      
+      if (match) {
+        const startId = parseInt(match[1]);
+        const endId = match[2] ? parseInt(match[2]) : startId;
+        
+        // Kirim file dari channel
+        return sendFilesFromChannel(chatId, from.id, startId, endId);
+      }
+    } catch (e) {
+      console.error('Error decoding base64:', e);
+    }
+  }
+
+  // Periksa subscription
+  const isSubscribed = await checkSubscription(from.id);
+  
+  if (!isSubscribed) {
+    return sendForceSubscribeMessage(chatId, from);
+  }
+
+  // Kirim pesan start
+  const startMsg = CONFIG.START_MSG
+    .replace('{first}', from.first_name)
+    .replace('{last}', from.last_name || '')
+    .replace('{username}', from.username ? `@${from.username}` : '')
+    .replace('{mention}', `<a href="tg://user?id=${from.id}">${from.first_name}</a>`)
+    .replace('{id}', from.id);
+
+  const buttons = [
+    [
+      { text: "• ᴛᴇɴᴛᴀɴɢ sᴀʏᴀ •", callback_data: "about" }
+    ],
+    [
+      { text: "𝗖𝗛𝗔𝗡𝗡𝗘𝗟", url: await getInviteLink(CONFIG.FORCE_SUB_CHANNEL) },
+      { text: "𝗚𝗥𝗢𝗨𝗣", url: await getInviteLink(CONFIG.FORCE_SUB_GROUP) }
+    ],
+    [
+      { text: "• ᴛᴜᴛᴜᴘ •", callback_data: "close" }
+    ]
+  ];
+
+  return sendMessage(chatId, startMsg, buttons, 'HTML');
+}
+
+async function handleBroadcastCommand(message) {
+  if (!message.reply_to_message) {
+    return sendMessage(message.chat.id, "Gunakan perintah ini dengan reply ke pesan yang ingin di-broadcast");
+  }
+
+  const users = await getAllUsers();
+  const broadcastMsg = message.reply_to_message;
+  let success = 0, failed = 0;
+
+  for (const user of users) {
+    try {
+      await forwardMessage(user.id, broadcastMsg.message_id, message.chat.id);
+      success++;
+      await new Promise(resolve => setTimeout(resolve, 100)); // Rate limiting
+    } catch (e) {
+      console.error(`Failed to send to user ${user.id}:`, e);
+      failed++;
+    }
+  }
+
+  const resultMsg = `Broadcast selesai:\n\nBerhasil: ${success}\nGagal: ${failed}`;
+  return sendMessage(message.chat.id, resultMsg);
+}
+
+async function handleBatchCommand(message) {
+  const chatId = message.chat.id;
+  
+  // Minta pesan pertama
+  await sendMessage(chatId, "Silakan forward pesan pertama dari channel database (dengan reply) atau kirim link pesan");
+
+  // Di production, Anda perlu mengimplementasikan state management untuk menangani alur percakapan
+  // Ini hanya contoh sederhana
+  return sendMessage(chatId, "Fitur batch akan diimplementasikan lebih lengkap dengan state management");
+}
+
+async function handleGenLinkCommand(message) {
+  const chatId = message.chat.id;
+  
+  if (!message.reply_to_message) {
+    return sendMessage(chatId, "Silakan reply ke pesan yang ingin dibuatkan link");
+  }
+
+  const msgId = message.reply_to_message.message_id;
+  const string = `get-${msgId * Math.abs(CONFIG.CHANNEL_ID)}`;
+  const base64String = btoa(string);
+  const link = `https://t.me/${(await getMe()).username}?start=${base64String}`;
+
+  const buttons = [
+    [
+      { text: "🔁 Share Link", url: `https://telegram.me/share/url?url=${encodeURIComponent(link)}` }
+    ]
+  ];
+
+  return sendMessage(chatId, `Link untuk pesan ini:\n\n${link}`, buttons);
+}
+
+async function handleUsersCommand(message) {
+  const users = await getAllUsers();
+  return sendMessage(message.chat.id, `Total pengguna: ${users.length}`);
+}
+
+async function handleIdCommand(message) {
+  const chatId = message.chat.id;
+  const userId = message.from.id;
+  return sendMessage(chatId, `ID Anda: <code>${userId}</code>`, null, 'HTML');
+}
+
+async function handlePingCommand(message) {
+  const start = Date.now();
+  const pingMsg = await sendMessage(message.chat.id, "Pinging...");
+  const end = Date.now();
+  
+  const pingTime = end - start;
+  const uptime = process.uptime();
+  const uptimeStr = formatUptime(uptime);
+  
+  const resultMsg = `<b>PONG!!</b>🏓\n` +
+    `<b>• Pinger -</b> <code>${pingTime}ms</code>\n` +
+    `<b>• Uptime -</b> <code>${uptimeStr}</code>`;
+  
+  return editMessageText(pingMsg.chat.id, pingMsg.message_id, resultMsg, 'HTML');
+}
+
+async function handleUptimeCommand(message) {
+  const uptime = process.uptime();
+  const uptimeStr = formatUptime(uptime);
+  const startTime = new Date(Date.now() - uptime * 1000).toISOString();
+  
+  const resultMsg = `🤖 <b>Bot Status:</b>\n` +
+    `• <b>Uptime:</b> <code>${uptimeStr}</code>\n` +
+    `• <b>Start Time:</b> <code>${startTime}</code>`;
+  
+  return sendMessage(message.chat.id, resultMsg, null, 'HTML');
+}
+
+/*********************
+ *  POST HANDLERS   *
+ *********************/
+
+async function handleFilePost(message) {
+  // Simpan file ke channel database
+  const postedMsg = await forwardMessage(CONFIG.CHANNEL_ID, message.message_id, message.chat.id);
+  
+  // Buat link sharing
+  const msgId = postedMsg.message_id;
+  const string = `get-${msgId * Math.abs(CONFIG.CHANNEL_ID)}`;
+  const base64String = btoa(string);
+  const link = `https://t.me/${(await getMe()).username}?start=${base64String}`;
+  
+  const buttons = [
+    [
+      { text: "🔁 Share Link", url: `https://telegram.me/share/url?url=${encodeURIComponent(link)}` }
+    ]
+  ];
+  
+  // Kirim link ke admin
+  return sendMessage(message.chat.id, `File berhasil disimpan!\n\nLink sharing: ${link}`, buttons);
+}
+
+async function handleChannelPost(post) {
+  if (post.chat.id !== CONFIG.CHANNEL_ID) return new Response('OK', { status: 200 });
+  
+  // Buat link untuk post di channel
+  const msgId = post.message_id;
+  const string = `get-${msgId * Math.abs(CONFIG.CHANNEL_ID)}`;
+  const base64String = btoa(string);
+  const link = `https://t.me/${(await getMe()).username}?start=${base64String}`;
+  
+  const buttons = [
+    [
+      { text: "🔁 Share Link", url: `https://telegram.me/share/url?url=${encodeURIComponent(link)}` }
+    ]
+  ];
+  
+  // Edit pesan di channel untuk tambahkan tombol
+  try {
+    await editMessageReplyMarkup(post.chat.id, post.message_id, buttons);
+  } catch (e) {
+    console.error('Error editing channel post:', e);
+  }
+  
+  return new Response('OK', { status: 200 });
+}
+
+/*********************
+ * CALLBACK HANDLERS *
+ *********************/
+
+async function handleCallbackQuery(callbackQuery) {
+  const data = callbackQuery.data;
+  const chatId = callbackQuery.message.chat.id;
+  const messageId = callbackQuery.message.message_id;
+  
+  switch (data) {
+    case 'about':
+      const aboutText = `<b>Tentang Bot ini:</b>\n\n` +
+        `• Creator: @${CONFIG.OWNER}\n` +
+        `• Channel: @${(await getChat(CONFIG.CHANNEL_ID)).username}\n` +
+        `• Support Group: @${(await getChat(CONFIG.FORCE_SUB_GROUP)).username}`;
+      
+      const buttons = [
+        [{ text: "• ᴛᴜᴛᴜᴘ •", callback_data: "close" }]
+      ];
+      
+      await editMessageText(chatId, messageId, aboutText, 'HTML', buttons);
+      break;
+      
+    case 'close':
+      await deleteMessage(chatId, messageId);
+      break;
+  }
+  
+  return answerCallbackQuery(callbackQuery.id);
+}
+
+/*********************
+ *  CORE FUNCTIONS  *
+ *********************/
+
+async function sendFilesFromChannel(chatId, userId, startId, endId) {
+  // Periksa subscription
+  const isSubscribed = await checkSubscription(userId);
+  if (!isSubscribed) {
+    const user = await getChatMember(userId, chatId);
+    return sendForceSubscribeMessage(chatId, user.user);
+  }
+
+  // Kirim pesan tunggu
+  const waitMsg = await sendMessage(chatId, "<code>Tunggu sebentar...</code>", null, 'HTML');
+  
+  // Dapatkan pesan dari channel
+  const messages = [];
+  const total = endId - startId + 1;
+  
+  for (let i = 0; i < total; i += 200) {
+    const batchSize = Math.min(200, total - i);
+    const batchIds = Array.from({length: batchSize}, (_, j) => startId + i + j);
+    
+    try {
+      const batchMsgs = await getMessages(CONFIG.CHANNEL_ID, batchIds);
+      messages.push(...batchMsgs);
+    } catch (e) {
+      console.error('Error getting messages:', e);
+      await new Promise(resolve => setTimeout(resolve, 1000)); // Jeda jika error
+    }
+  }
+  
+  // Hapus pesan tunggu
+  await deleteMessage(chatId, waitMsg.message_id);
+  
+  // Kirim file ke user
+  for (const msg of messages) {
+    try {
+      await copyMessage(chatId, CONFIG.CHANNEL_ID, msg.message_id);
+      await new Promise(resolve => setTimeout(resolve, 500)); // Jeda antar pesan
+    } catch (e) {
+      console.error('Error sending file:', e);
+    }
+  }
+  
+  return new Response('OK', { status: 200 });
+}
+
+async function checkSubscription(userId) {
+  if (CONFIG.ADMINS.includes(userId)) return true;
+  
+  try {
+    // Periksa channel
+    const channelMember = await getChatMember(userId, CONFIG.FORCE_SUB_CHANNEL);
+    if (!['creator', 'administrator', 'member'].includes(channelMember.status)) {
+      return false;
+    }
+    
+    // Periksa group
+    const groupMember = await getChatMember(userId, CONFIG.FORCE_SUB_GROUP);
+    return ['creator', 'administrator', 'member'].includes(groupMember.status);
+  } catch (e) {
+    console.error('Error checking subscription:', e);
+    return false;
+  }
+}
+
+async function sendForceSubscribeMessage(chatId, user) {
+  const forceMsg = CONFIG.FORCE_MSG
+    .replace('{first}', user.first_name)
+    .replace('{last}', user.last_name || '')
+    .replace('{username}', user.username ? `@${user.username}` : '')
+    .replace('{mention}', `<a href="tg://user?id=${user.id}">${user.first_name}</a>`)
+    .replace('{id}', user.id);
+  
+  const buttons = [
+    [
+      { text: "𝗖𝗛𝗔𝗡𝗡𝗘𝗟", url: await getInviteLink(CONFIG.FORCE_SUB_CHANNEL) },
+      { text: "𝗚𝗥𝗢𝗨𝗣", url: await getInviteLink(CONFIG.FORCE_SUB_GROUP) }
+    ]
+  ];
+  
+  return sendMessage(chatId, forceMsg, buttons, 'HTML');
+}
+
+/*********************
+ * HELPER FUNCTIONS *
+ *********************/
+
+// Format waktu uptime
+function formatUptime(seconds) {
+  const units = [
+    ['week', 604800],
+    ['day', 86400],
+    ['hour', 3600],
+    ['min', 60],
+    ['sec', 1]
+  ];
+  
+  const parts = [];
+  for (const [name, div] of units) {
+    const value = Math.floor(seconds / div);
+    if (value > 0) {
+      parts.push(`${value} ${name}${value !== 1 ? 's' : ''}`);
+      seconds %= div;
+    }
+  }
+  
+  return parts.join(', ') || '0 sec';
+}
+
+// Database functions (using Cloudflare KV)
+async function addUser(userId, username) {
+  const users = JSON.parse(await USERS_KV.get('users') || '[]');
+  if (!users.some(u => u.id === userId)) {
+    users.push({ id: userId, username, timestamp: Date.now() });
+    await USERS_KV.put('users', JSON.stringify(users));
+  }
+}
+
+async function getAllUsers() {
+  return JSON.parse(await USERS_KV.get('users') || '[]');
+}
+
+// Telegram API wrappers
+async function getMe() {
+  const response = await fetch(`${API_URL}/getMe`);
+  return (await response.json()).result;
+}
+
+async function getChat(chatId) {
+  const response = await fetch(`${API_URL}/getChat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId })
+  });
+  return (await response.json()).result;
+}
+
+async function getChatMember(userId, chatId) {
+  const response = await fetch(`${API_URL}/getChatMember`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, user_id: userId })
+  });
+  return (await response.json()).result;
+}
+
+async function getMessages(chatId, messageIds) {
+  const response = await fetch(`${API_URL}/getMessages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, message_ids: messageIds })
+  });
+  return (await response.json()).result;
+}
+
+async function getInviteLink(chatId) {
+  const response = await fetch(`${API_URL}/exportChatInviteLink`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId })
+  });
+  return (await response.json()).result;
+}
+
+async function sendMessage(chatId, text, replyMarkup = null, parseMode = null) {
+  const payload = {
+    chat_id: chatId,
+    text: text,
+    disable_web_page_preview: true
+  };
+
+  if (replyMarkup) {
+    payload.reply_markup = { inline_keyboard: replyMarkup };
+  }
+
+  if (parseMode) {
+    payload.parse_mode = parseMode;
+  }
+
+  const response = await fetch(`${API_URL}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  return (await response.json()).result;
+}
+
+async function editMessageText(chatId, messageId, text, parseMode = null, replyMarkup = null) {
+  const payload = {
+    chat_id: chatId,
+    message_id: messageId,
+    text: text
+  };
+
+  if (parseMode) {
+    payload.parse_mode = parseMode;
+  }
+
+  if (replyMarkup) {
+    payload.reply_markup = { inline_keyboard: replyMarkup };
+  }
+
+  const response = await fetch(`${API_URL}/editMessageText`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  return (await response.json()).result;
+}
+
+async function editMessageReplyMarkup(chatId, messageId, replyMarkup) {
+  const response = await fetch(`${API_URL}/editMessageReplyMarkup`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: { inline_keyboard: replyMarkup }
+    })
+  });
+
+  return (await response.json()).result;
+}
+
+async function deleteMessage(chatId, messageId) {
+  await fetch(`${API_URL}/deleteMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId
+    })
+  });
+}
+
+async function forwardMessage(toChatId, messageId, fromChatId) {
+  const response = await fetch(`${API_URL}/forwardMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: toChatId,
+      from_chat_id: fromChatId,
+      message_id: messageId
+    })
+  });
+
+  return (await response.json()).result;
+}
+
+async function copyMessage(chatId, fromChatId, messageId) {
+  const response = await fetch(`${API_URL}/copyMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      from_chat_id: fromChatId,
+      message_id: messageId
+    })
+  });
+
+  return (await response.json()).result;
+}
+
+async function answerCallbackQuery(callbackQueryId) {
+  await fetch(`${API_URL}/answerCallbackQuery`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      callback_query_id: callbackQueryId
+    })
+  });
+}
+
+// Inisialisasi
+async function initialize() {
+  // Coba dapatkan link invite
+  try {
+    await getInviteLink(CONFIG.FORCE_SUB_CHANNEL);
+    await getInviteLink(CONFIG.FORCE_SUB_GROUP);
+  } catch (e) {
+    console.error('Error initializing invite links:', e);
+  }
+}
+
+// Jalankan inisialisasi saat worker dimulai
+initialize();
